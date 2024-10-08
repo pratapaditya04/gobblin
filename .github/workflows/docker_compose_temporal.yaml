@@ -26,7 +26,7 @@ on:
       - master
     paths:
       - 'gobblin-docker/**'
-      - '.github/workflows/docker_build_publish.yaml'
+      - '.github/workflows/docker_compose_temporal.yaml'
   release:
     types: [published, edited]
 
