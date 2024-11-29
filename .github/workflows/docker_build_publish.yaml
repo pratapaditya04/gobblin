@@ -72,3 +72,4 @@ jobs:
           tags: ${{ steps.build_tag.outputs.tag }}
           push: ${{ github.event_name == 'release' }}
           file: ./gobblin-docker/gobblin/alpine-gobblin-latest/Dockerfile
+
