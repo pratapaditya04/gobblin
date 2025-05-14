@@ -20,6 +20,7 @@ package org.apache.gobblin.runtime.kafka;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +76,10 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
   private static final String DEFAULT_CONSUMER_CLIENT_FACTORY_CLASS =
       "org.apache.gobblin.kafka.client.Kafka09ConsumerClient$Factory";
   public static final String ENABLE_AUTO_COMMIT_KEY = "enable.auto.commit";
+
+  public static final String QUEUE_MAX_SIZE = "queue.max.size";
+
+  public static final int QUEUE_MAX_SIZE_DEFAULT = 1000;
   public static final boolean DEFAULT_AUTO_COMMIT_VALUE = false;
 
   public static final String GROUP_ID_KEY = "group.id";
@@ -129,8 +134,9 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
     this.consumerExecutor = Executors.newSingleThreadScheduledExecutor(ExecutorsUtils.newThreadFactory(Optional.of(log), Optional.of("HighLevelConsumerThread")));
     this.queueExecutor = Executors.newFixedThreadPool(this.numThreads, ExecutorsUtils.newThreadFactory(Optional.of(log), Optional.of("QueueProcessor-%d")));
     this.queues = new LinkedBlockingQueue[numThreads];
+    final int queueMaxSize = ConfigUtils.getInt(config, QUEUE_MAX_SIZE, QUEUE_MAX_SIZE_DEFAULT);
     for(int i = 0; i < queues.length; i++) {
-      this.queues[i] = new LinkedBlockingQueue();
+      this.queues[i] = new LinkedBlockingQueue(queueMaxSize);
     }
     this.recordsProcessed = new AtomicInteger(0);
     this.partitionOffsetsToCommit = new ConcurrentHashMap<>();
@@ -255,6 +261,7 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
    */
   protected void consume() {
     try {
+      final HashSet<Integer>  kafkaPartitionsWithFullQueue = new HashSet<>();
       Iterator<KafkaConsumerRecord> itr = gobblinKafkaConsumerClient.consume();
       // TODO: we may be committing too early and only want to commit after process messages
       if(!enableAutoCommit) {
@@ -263,9 +270,14 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
       while (itr.hasNext()) {
         KafkaConsumerRecord record = itr.next();
         int idx = record.getPartition() % numThreads;
-        queues[idx].put(record);
+        if(kafkaPartitionsWithFullQueue.contains(idx)){
+          continue; // Skip processing all messages in this queue, there is no fear of message loss , as we will not be committing offset for these messages, and they will be fetched in the subsequent poll
+        }
+        if(!queues[idx].offer(record)){
+          kafkaPartitionsWithFullQueue.add(idx);
+        }
       }
-    } catch (InterruptedException e) {
+    } catch (Exception e) {
       log.warn("Exception encountered while consuming records and adding to queue {}", e);
       Thread.currentThread().interrupt();
     }
