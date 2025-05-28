@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.regex.Pattern;
 
+import org.apache.gobblin.runtime.kafka.HighLevelConsumerTest;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 

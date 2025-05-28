@@ -73,4 +73,8 @@ public class MockedHighLevelConsumer extends HighLevelConsumer<byte[], byte[]> {
   public void shutDown() {
     super.shutDown();
   }
+
+  public BlockingQueue[] getQueues(){
+    return this.get_blockingQueues();
+  }
 }
