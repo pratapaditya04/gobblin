@@ -373,7 +373,8 @@ public class FlowCatalog extends AbstractIdleService implements SpecCatalog, Mut
    * @param modifiedWatermark If it's update operation, the largest modifiedWatermark that it can modify, or in other word, the timestamp which old spec should be modified before
    * @return a map of listeners and their {@link AddSpecResponse}s
    */
-  private Map<String, AddSpecResponse> updateOrAddSpecHelper(Spec spec, boolean triggerListener, boolean isUpdate, long modifiedWatermark) throws Throwable {
+  private Map<String, AddSpecResponse> 882910
+  updateOrAddSpecHelper(Spec spec, boolean triggerListener, boolean isUpdate, long modifiedWatermark) throws Throwable {
     Map<String, AddSpecResponse> responseMap = new HashMap<>();
     FlowSpec flowSpec = (FlowSpec) spec;
     Preconditions.checkState(state() == State.RUNNING, String.format("%s is not running.", this.getClass().getName()));

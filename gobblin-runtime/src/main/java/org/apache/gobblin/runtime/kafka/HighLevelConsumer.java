@@ -106,7 +106,8 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
   private final GobblinKafkaConsumerClient gobblinKafkaConsumerClient;
   protected final ScheduledExecutorService consumerExecutor;
   private final ExecutorService queueExecutor;
-  private final BlockingQueue[] queues;
+  @Getter
+  private final BlockingQueue[] _blockingQueues;
   private ContextAwareGauge[] queueSizeGauges;
   private final AtomicInteger recordsProcessed;
   private final Map<KafkaPartition, Long> partitionOffsetsToCommit;
@@ -133,10 +134,10 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
     assignTopicPartitions();
     this.consumerExecutor = Executors.newSingleThreadScheduledExecutor(ExecutorsUtils.newThreadFactory(Optional.of(log), Optional.of("HighLevelConsumerThread")));
     this.queueExecutor = Executors.newFixedThreadPool(this.numThreads, ExecutorsUtils.newThreadFactory(Optional.of(log), Optional.of("QueueProcessor-%d")));
-    this.queues = new LinkedBlockingQueue[numThreads];
+    this._blockingQueues = new LinkedBlockingQueue[numThreads];
     final int queueMaxSize = ConfigUtils.getInt(config, QUEUE_MAX_SIZE, QUEUE_MAX_SIZE_DEFAULT);
-    for(int i = 0; i < queues.length; i++) {
-      this.queues[i] = new LinkedBlockingQueue(queueMaxSize);
+    for(int i = 0; i < _blockingQueues.length; i++) {
+      this._blockingQueues[i] = new LinkedBlockingQueue(queueMaxSize);
     }
     this.recordsProcessed = new AtomicInteger(0);
     this.partitionOffsetsToCommit = new ConcurrentHashMap<>();
@@ -213,7 +214,7 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
       int finalI = i;
       this.queueSizeGauges[i] = this.metricContext.newContextAwareGauge(prefix +
           RuntimeMetrics.GOBBLIN_KAFKA_HIGH_LEVEL_CONSUMER_QUEUE_SIZE_PREFIX + "-" + i,
-          () -> queues[finalI].size());
+          () -> _blockingQueues[finalI].size());
     }
   }
 
@@ -273,7 +274,7 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
         if(kafkaPartitionsWithFullQueue.contains(idx)){
           continue; // Skip processing all messages in this queue, there is no fear of message loss , as we will not be committing offset for these messages, and they will be fetched in the subsequent poll
         }
-        if(!queues[idx].offer(record)){
+        if(!_blockingQueues[idx].offer(record)){
           kafkaPartitionsWithFullQueue.add(idx);
         }
       }
@@ -288,7 +289,7 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
    * Note: Assumption here is that {@link #numThreads} is same a number of queues
    */
   protected void processQueues() {
-    for(BlockingQueue queue : queues) {
+    for(BlockingQueue queue : _blockingQueues) {
       queueExecutor.execute(new QueueProcessor(queue));
     }
   }
@@ -320,6 +321,7 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
 
   @Override
   public void shutDown() {
+
     shutdownRequested = true;
     ExecutorsUtils.shutdownExecutorService(this.consumerExecutor, Optional.of(log), 5000, TimeUnit.MILLISECONDS);
     ExecutorsUtils.shutdownExecutorService(this.queueExecutor, Optional.of(log), 5000, TimeUnit.MILLISECONDS);

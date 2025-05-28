@@ -22,6 +22,7 @@ import java.util.Collection;
 import java.util.List;
 
 import org.apache.avro.Schema;
+import org.apache.gobblin.runtime.kafka.HighLevelConsumerTest;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 

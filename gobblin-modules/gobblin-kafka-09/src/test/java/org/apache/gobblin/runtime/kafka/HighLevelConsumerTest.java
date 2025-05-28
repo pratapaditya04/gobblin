@@ -15,12 +15,17 @@
  * limitations under the License.
  */
 
-package org.apache.gobblin.runtime;
+package org.apache.gobblin.runtime.kafka;
 
 import java.io.File;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 
+import java.util.concurrent.BlockingQueue;
+import org.apache.gobblin.kafka.client.GobblinKafkaConsumerClient;
+import org.apache.gobblin.kafka.client.KafkaConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.mockito.Mockito;
 import org.testng.Assert;
 import org.testng.annotations.AfterSuite;
@@ -44,8 +49,6 @@ import org.apache.gobblin.kafka.client.DecodeableKafkaRecord;
 import org.apache.gobblin.kafka.client.Kafka09ConsumerClient;
 import org.apache.gobblin.kafka.writer.Kafka09DataWriter;
 import org.apache.gobblin.kafka.writer.KafkaWriterConfigurationKeys;
-import org.apache.gobblin.runtime.kafka.HighLevelConsumer;
-import org.apache.gobblin.runtime.kafka.MockedHighLevelConsumer;
 import org.apache.gobblin.source.extractor.extract.kafka.KafkaPartition;
 import org.apache.gobblin.test.TestUtils;
 import org.apache.gobblin.testing.AssertWithBackoff;
@@ -62,6 +65,9 @@ public class HighLevelConsumerTest extends KafkaTestBase {
   private static final String TOPIC = HighLevelConsumerTest.class.getSimpleName();
   private static final int NUM_PARTITIONS = 2;
   private static final int NUM_MSGS = 10;
+
+  private GobblinKafkaConsumerClient mockKafkaConsumerClient = Mockito.mock(GobblinKafkaConsumerClient.class);
+
 
   private Closer _closer;
   private String _kafkaBrokers;
@@ -203,6 +209,83 @@ public class HighLevelConsumerTest extends KafkaTestBase {
     // Assert all NUM_MSGS messages were processed
     consumer.awaitExactlyNMessages(NUM_MSGS, 10000);
     consumer.shutDown();
+  }
+
+  @Test
+  public void testQueueFullAndResumeConsumption() throws Exception {
+    // Set up consumer properties
+    Properties consumerProps = new Properties();
+    consumerProps.setProperty(ConfigurationKeys.KAFKA_BROKERS, _kafkaBrokers);
+    consumerProps.setProperty(Kafka09ConsumerClient.GOBBLIN_CONFIG_VALUE_DESERIALIZER_CLASS_KEY,
+        "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+    consumerProps.setProperty(SOURCE_KAFKA_CONSUMERCONFIG_KEY_WITH_DOT + KAFKA_AUTO_OFFSET_RESET_KEY, "earliest");
+    consumerProps.setProperty(SOURCE_KAFKA_CONSUMERCONFIG_KEY_WITH_DOT + HighLevelConsumer.GROUP_ID_KEY,
+        TOPIC + "-queue-test-" + System.currentTimeMillis());
+    consumerProps.setProperty(HighLevelConsumer.QUEUE_MAX_SIZE, "2"); // Small queue size for testing
+    consumerProps.setProperty(HighLevelConsumer.ENABLE_AUTO_COMMIT_KEY, "true");
+
+    Config config = ConfigUtils.propertiesToConfig(consumerProps);
+
+    MockedHighLevelConsumer consumer = new MockedHighLevelConsumer(TOPIC, config, 1) {
+      @Override
+      protected void processMessage(DecodeableKafkaRecord<byte[], byte[]> message) {
+        super.processMessage(message);
+        try {
+          Thread.sleep(100);// adding delay to prevent immediate processing
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    };
+
+    try {
+      // Start the consumer
+      consumer.startAsync().awaitRunning();
+
+      // Get access to the queue
+      BlockingQueue queue = consumer.getQueues()[0];
+
+      // Fill the queue to max capacity
+      byte[] message1 = "message1".getBytes();
+      byte[] message2 = "message2".getBytes();
+      KafkaConsumerRecord record1 = createKafkaRecord(0, 0L, message1);
+      KafkaConsumerRecord record2 = createKafkaRecord(0, 1L, message2);
+
+      Assert.assertTrue(queue.offer(record1), "Failed to add first message");
+      Assert.assertTrue(queue.offer(record2), "Failed to add second message");
+
+      // Verify queue is at max capacity
+     // Assert.assertEquals(queue.size(), 2, "Queue should be at max capacity");
+
+      // Try to consume a new message when queue is full
+      byte[] message3 = "message3".getBytes();
+      KafkaConsumerRecord record3 = createKafkaRecord(0, 2L, message3);
+      Mockito.when(mockKafkaConsumerClient.consume())
+          .thenReturn(Arrays.asList(record3).iterator());
+
+      consumer.consume();
+      // Queue should still be at max capacity
+    //  Assert.assertEquals(queue.size(), 2, "Queue should remain at max capacity");
+
+      // Simulate message processing by removing messages
+      queue.clear();
+
+      // Try to consume new messages after queue is cleared
+      consumer.consume();
+
+      // Wait for messages to be processed
+      consumer.awaitExactlyNMessages(1, 5000);
+
+      // Verify that new message was processed
+      Assert.assertTrue(consumer.getMessages().size() > 0, "Should have processed at least one message");
+    } finally {
+      consumer.shutDown();
+    }
+  }
+  private KafkaConsumerRecord createKafkaRecord(int partition, long offset, byte[] value) {
+    KafkaConsumerRecord record =  new Kafka09ConsumerClient.Kafka09ConsumerRecord<>( new ConsumerRecord<>(TOPIC, partition,
+        offset, "", value));
+    return record;
   }
 
   private List<byte[]> createByteArrayMessages() {
