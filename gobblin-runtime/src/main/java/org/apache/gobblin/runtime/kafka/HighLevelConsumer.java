@@ -327,6 +327,7 @@ public abstract class HighLevelConsumer<K,V> extends AbstractIdleService {
     ExecutorsUtils.shutdownExecutorService(this.queueExecutor, Optional.of(log), 5000, TimeUnit.MILLISECONDS);
     try {
       this.gobblinKafkaConsumerClient.close();
+
       this.shutdownMetrics();
     } catch (IOException e) {
       log.warn("Failed to shut down consumer client or metrics ", e);
