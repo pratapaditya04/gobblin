@@ -46,6 +46,7 @@ import io.temporal.serviceclient.WorkflowServiceStubs;
 
 import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.example.simplejson.SimpleJsonSource;
+import org.apache.gobblin.metrics.event.TimingEvent;
 import org.apache.gobblin.runtime.JobState;
 import org.apache.gobblin.runtime.locks.FileBasedJobLock;
 import org.apache.gobblin.source.workunit.WorkUnit;
@@ -126,6 +127,10 @@ public class GobblinTemporalJobLauncherTest {
 
   @BeforeMethod
   public void methodSetUp() throws Exception {
+    // Reset invocation counts on the class-scoped mocks so per-test `verify(... times(N))` assertions
+    // are not polluted by interactions from earlier tests in the suite.
+    Mockito.clearInvocations(mockClient, mockExecutionInfo);
+
     mockStub = mock(WorkflowStub.class);
     when(mockClient.newUntypedWorkflowStub(Mockito.anyString())).thenReturn(mockStub);
     when(mockStub.getExecution()).thenReturn(WorkflowExecution.getDefaultInstance());
@@ -302,6 +307,91 @@ public class GobblinTemporalJobLauncherTest {
 
     assertFalse(stagingDir.exists(), "close() should trigger cleanup and delete the staging directory");
     tmpDir.delete();
+  }
+
+  @Test
+  public void testMapWorkflowStatusToEventNameForCompletedEmitsJobSucceeded() {
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_COMPLETED),
+        TimingEvent.LauncherTimings.JOB_SUCCEEDED);
+  }
+
+  @Test
+  public void testMapWorkflowStatusToEventNameForCancelledEmitsJobCancel() {
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_CANCELED),
+        TimingEvent.LauncherTimings.JOB_CANCEL);
+  }
+
+  @Test
+  public void testMapWorkflowStatusToEventNameForFailureStatusesEmitsJobFailed() {
+    // FAILED, TERMINATED, TIMED_OUT are all genuine workflow-side failures that should map to JOB_FAILED.
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_FAILED),
+        TimingEvent.LauncherTimings.JOB_FAILED);
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_TERMINATED),
+        TimingEvent.LauncherTimings.JOB_FAILED);
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_TIMED_OUT),
+        TimingEvent.LauncherTimings.JOB_FAILED);
+  }
+
+  @Test
+  public void testMapWorkflowStatusToEventNameForNonTerminalStatusesEmitsJobFailed() {
+    // RUNNING / CONTINUED_AS_NEW / UNSPECIFIED mean the AM is going down while the workflow has not reached a
+    // terminal state. From the GaaS perspective this is a failure-to-complete, so we surface JOB_FAILED rather
+    // than leaving the consumer without a terminal event.
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING),
+        TimingEvent.LauncherTimings.JOB_FAILED);
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW),
+        TimingEvent.LauncherTimings.JOB_FAILED);
+    assertEquals(GobblinTemporalJobLauncher.mapWorkflowStatusToEventName(
+            WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED),
+        TimingEvent.LauncherTimings.JOB_FAILED);
+  }
+
+  @Test
+  public void testEmitJobCompletionGTESkipsWhenWorkflowIdUnset() throws Exception {
+    // submitJob has not been called, so this.workflowId is null. The hook must short-circuit and not even
+    // attempt to describe a workflow, otherwise it would NPE on the WorkflowClient call.
+    jobLauncher.emitJobCompletionGTE();
+
+    verify(mockClient, times(0)).newUntypedWorkflowStub(Mockito.anyString());
+  }
+
+  @Test
+  public void testEmitJobCompletionGTEIsIdempotent() throws Exception {
+    jobLauncher.submitJob(null);
+    when(mockExecutionInfo.getStatus())
+        .thenReturn(WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_COMPLETED);
+
+    jobLauncher.emitJobCompletionGTE();
+    jobLauncher.emitJobCompletionGTE();
+
+    // newUntypedWorkflowStub is the entry point inside fetchWorkflowStatus; only the first emit call should reach it.
+    verify(mockClient, times(1)).newUntypedWorkflowStub(Mockito.anyString());
+  }
+
+  @Test
+  public void testEmitJobCompletionGTEHandlesDescribeFailureWithoutThrowing() throws Exception {
+    jobLauncher.submitJob(null);
+    // Simulate Temporal being unreachable / describe failing at hook fire time. The hook must swallow the error
+    // and still mark itself as fired so a subsequent invocation does not retry.
+    Mockito.doThrow(new RuntimeException("temporal unreachable"))
+        .when(mockExecutionInfo).getStatus();
+    try {
+      jobLauncher.emitJobCompletionGTE();
+      // Second invocation must be a no-op even though the first one failed to fetch status.
+      jobLauncher.emitJobCompletionGTE();
+
+      verify(mockClient, times(1)).newUntypedWorkflowStub(Mockito.anyString());
+    } finally {
+      // Always restore mock state so the doThrow does not leak into subsequent tests in the suite.
+      Mockito.reset(mockExecutionInfo);
+    }
   }
 
   @Test

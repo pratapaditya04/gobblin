@@ -155,8 +155,9 @@ public class ExecuteGobblinWorkflowImpl implements ExecuteGobblinWorkflow {
       return new ExecGobblinStats(numWUsGenerated, numWUsCommitted, recordsWritten, bytesWritten,
           jobProps.getProperty(Help.USER_TO_PROXY_KEY));
     } catch (Exception e) {
-      // Emit a failed GobblinTrackingEvent to record job failures
-      timerFactory.create(TimingEvent.LauncherTimings.JOB_FAILED).submit(); // update GaaS: `ExecutionStatus.FAILED`; `TimingEvent.JOB_END_TIME`
+      // Note: the JOB_FAILED GobblinTrackingEvent is now emitted by GobblinTemporalJobLauncher's JVM shutdown hook,
+      // which queries Temporal for the workflow's terminal status. This keeps the AM JVM as the single source of
+      // truth for completion GTEs (success/failure/cancel/terminate/timeout/abandoned-while-running).
       throw ApplicationFailure.newNonRetryableFailureWithCause(
           String.format("Failed Gobblin job %s", jobProps.getProperty(ConfigurationKeys.JOB_NAME_KEY)),
           e.getClass().getName(), e);

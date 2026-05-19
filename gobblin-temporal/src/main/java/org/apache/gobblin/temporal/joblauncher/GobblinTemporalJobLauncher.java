@@ -18,12 +18,16 @@
 package org.apache.gobblin.temporal.joblauncher;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.eventbus.EventBus;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
@@ -43,7 +47,9 @@ import org.slf4j.Logger;
 import org.apache.gobblin.annotation.Alpha;
 import org.apache.gobblin.cluster.GobblinClusterConfigurationKeys;
 import org.apache.gobblin.cluster.event.ClusterManagerShutdownRequest;
+import org.apache.gobblin.configuration.ConfigurationKeys;
 import org.apache.gobblin.metrics.Tag;
+import org.apache.gobblin.metrics.event.TimingEvent;
 import org.apache.gobblin.runtime.JobLauncher;
 import org.apache.gobblin.source.workunit.WorkUnit;
 import org.apache.gobblin.temporal.cluster.GobblinTemporalTaskRunner;
@@ -75,11 +81,22 @@ public abstract class GobblinTemporalJobLauncher extends GobblinJobLauncher {
   private static final Logger log = Workflow.getLogger(GobblinTemporalJobLauncher.class);
   private static final int TERMINATION_TIMEOUT_SECONDS = 3;
 
+  @VisibleForTesting
+  static final String WORKFLOW_ID_METADATA_FIELD = "workflowId";
+  @VisibleForTesting
+  static final String WORKFLOW_STATUS_METADATA_FIELD = "workflowStatus";
+  @VisibleForTesting
+  static final String FAILURE_REASON_METADATA_FIELD = "failureReason";
+  @VisibleForTesting
+  static final String AM_TERMINATED_DURING_EXECUTION_REASON = "AM_TERMINATED_DURING_EXECUTION";
+
   protected ManagedWorkflowServiceStubs managedWorkflowServiceStubs;
   protected WorkflowClient client;
   protected String queueName;
   protected String namespace;
   protected String workflowId;
+
+  private final AtomicBoolean jobCompletionGTEEmitted = new AtomicBoolean(false);
 
   public GobblinTemporalJobLauncher(Properties jobProps, Path appWorkDir,
                                     List<? extends Tag<?>> metadataTags, ConcurrentHashMap<String, Boolean> runningMap, EventBus eventBus)
@@ -98,6 +115,128 @@ public abstract class GobblinTemporalJobLauncher extends GobblinJobLauncher {
     // non-null value indicates job has been submitted
     this.workflowId = null;
     startCancellationExecutor();
+    registerJobCompletionGTEHook();
+  }
+
+  /**
+   * Register a JVM shutdown hook that, on AM exit, queries Temporal for the workflow's terminal state and
+   * emits a single {@link org.apache.gobblin.metrics.GobblinTrackingEvent} capturing the outcome. Mirrors the
+   * {@code registerCleanupShutdownHook} pattern in {@link GobblinJobLauncher}. Because in temporal-on-yarn each
+   * Yarn application launches exactly one workflow (see {@link #handleLaunchFinalization}), AM termination
+   * coincides with job completion, so this hook is the single source of truth for job-completion GTEs.
+   */
+  private void registerJobCompletionGTEHook() {
+    Runtime.getRuntime().addShutdownHook(
+        new Thread(this::emitJobCompletionGTE,
+            "GobblinTemporalJobLauncher-JobCompletionGTE-" + this.jobContext.getJobId()));
+  }
+
+  /**
+   * Fetch the workflow's terminal {@link WorkflowExecutionStatus} from Temporal, translate it to the corresponding
+   * {@link TimingEvent.LauncherTimings} event name, and submit the GTE via the inherited {@code eventSubmitter}.
+   * Idempotency-guarded so multiple shutdown triggers result in a single emission.
+   */
+  @VisibleForTesting
+  void emitJobCompletionGTE() {
+    if (!jobCompletionGTEEmitted.compareAndSet(false, true)) {
+      return;
+    }
+    if (this.workflowId == null) {
+      // submitJob was never invoked on this launcher; nothing to report.
+      return;
+    }
+    try {
+      WorkflowExecutionStatus status = fetchWorkflowStatus();
+      String eventName = mapWorkflowStatusToEventName(status);
+      Map<String, String> metadata = buildCompletionMetadata(status);
+      new TimingEvent(this.eventSubmitter, eventName).stop(metadata);
+      log.info("Emitted job completion GTE {} for workflow {} (Temporal status {})",
+          eventName, this.workflowId, status);
+    } catch (Exception e) {
+      log.error("Failed to emit job completion GTE for workflow " + this.workflowId, e);
+    }
+  }
+
+  /**
+   * Query Temporal for the current execution status of {@link #workflowId}. Returns
+   * {@code WORKFLOW_EXECUTION_STATUS_UNSPECIFIED} as a safe fallback if the describe call fails, so callers
+   * downstream emit a JOB_FAILED rather than swallowing the GTE entirely.
+   */
+  private WorkflowExecutionStatus fetchWorkflowStatus() {
+    try {
+      WorkflowStub workflowStub = this.client.newUntypedWorkflowStub(this.workflowId);
+      DescribeWorkflowExecutionRequest request = DescribeWorkflowExecutionRequest.newBuilder()
+          .setNamespace(this.namespace)
+          .setExecution(workflowStub.getExecution())
+          .build();
+      DescribeWorkflowExecutionResponse response = managedWorkflowServiceStubs.getWorkflowServiceStubs()
+          .blockingStub().describeWorkflowExecution(request);
+      return response.getWorkflowExecutionInfo().getStatus();
+    } catch (Exception e) {
+      log.warn("Failed to describe workflow {} for completion GTE; treating as UNSPECIFIED (will emit JOB_FAILED)",
+          this.workflowId, e);
+      return WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED;
+    }
+  }
+
+  /**
+   * Build the GTE metadata carrying flow/job identifiers (required by {@code KafkaAvroJobStatusMonitor.acceptEvent},
+   * which drops events lacking flow group/name/executionId), plus diagnostic fields for the workflow status.
+   * When the workflow is still RUNNING at AM shutdown, mark a synthetic failure reason so downstream consumers can
+   * distinguish AM-killed-mid-execute from a genuine workflow failure.
+   */
+  private Map<String, String> buildCompletionMetadata(WorkflowExecutionStatus status) {
+    Map<String, String> metadata = new HashMap<>();
+    metadata.put(WORKFLOW_ID_METADATA_FIELD, this.workflowId);
+    metadata.put(WORKFLOW_STATUS_METADATA_FIELD, status.name());
+    addFlowMetadataIfPresent(metadata, TimingEvent.FlowEventConstants.FLOW_GROUP_FIELD, ConfigurationKeys.FLOW_GROUP_KEY);
+    addFlowMetadataIfPresent(metadata, TimingEvent.FlowEventConstants.FLOW_NAME_FIELD, ConfigurationKeys.FLOW_NAME_KEY);
+    addFlowMetadataIfPresent(metadata, TimingEvent.FlowEventConstants.FLOW_EXECUTION_ID_FIELD, ConfigurationKeys.FLOW_EXECUTION_ID_KEY);
+    addFlowMetadataIfPresent(metadata, TimingEvent.FlowEventConstants.JOB_NAME_FIELD, ConfigurationKeys.JOB_NAME_KEY);
+    addFlowMetadataIfPresent(metadata, TimingEvent.FlowEventConstants.JOB_GROUP_FIELD, ConfigurationKeys.JOB_GROUP_KEY);
+    if (isNonTerminal(status)) {
+      metadata.put(FAILURE_REASON_METADATA_FIELD, AM_TERMINATED_DURING_EXECUTION_REASON);
+    }
+    return metadata;
+  }
+
+  private void addFlowMetadataIfPresent(Map<String, String> metadata, String metadataKey, String jobPropKey) {
+    String value = this.jobProps.getProperty(jobPropKey);
+    if (value != null) {
+      metadata.put(metadataKey, value);
+    }
+  }
+
+  /**
+   * Map a Temporal {@link WorkflowExecutionStatus} to the {@link TimingEvent.LauncherTimings} event name that
+   * {@code KafkaAvroJobStatusMonitor.parseJobStatus} understands. Non-terminal statuses (RUNNING,
+   * CONTINUED_AS_NEW, UNSPECIFIED) collapse to JOB_FAILED — the AM is going down, so from the GaaS perspective
+   * the job did not complete successfully.
+   */
+  @VisibleForTesting
+  static String mapWorkflowStatusToEventName(WorkflowExecutionStatus status) {
+    switch (status) {
+      case WORKFLOW_EXECUTION_STATUS_COMPLETED:
+        return TimingEvent.LauncherTimings.JOB_SUCCEEDED;
+      case WORKFLOW_EXECUTION_STATUS_CANCELED:
+        return TimingEvent.LauncherTimings.JOB_CANCEL;
+      case WORKFLOW_EXECUTION_STATUS_FAILED:
+      case WORKFLOW_EXECUTION_STATUS_TERMINATED:
+      case WORKFLOW_EXECUTION_STATUS_TIMED_OUT:
+      case WORKFLOW_EXECUTION_STATUS_RUNNING:
+      case WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW:
+      case WORKFLOW_EXECUTION_STATUS_UNSPECIFIED:
+      case UNRECOGNIZED:
+      default:
+        return TimingEvent.LauncherTimings.JOB_FAILED;
+    }
+  }
+
+  private static boolean isNonTerminal(WorkflowExecutionStatus status) {
+    return status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
+        || status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_CONTINUED_AS_NEW
+        || status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED
+        || status == WorkflowExecutionStatus.UNRECOGNIZED;
   }
 
   /** @return {@link Config} now featuring all overrides rooted at {@link GobblinTemporalConfigurationKeys#GOBBLIN_TEMPORAL_JOB_LAUNCHER_CONFIG_OVERRIDES} */
