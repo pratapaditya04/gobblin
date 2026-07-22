@@ -60,4 +60,11 @@ public class JobStatus {
   private final Supplier<List<Issue>> issues;
   private final int progressPercentage;
   private final long lastProgressEventTime;
+  // Optional per-dataset copy metrics surfaced on the job-status REST API (JobStatistics).
+  // -1 = unset/unsupported; populated for writers that report them (e.g. DDM file/blob replication).
+  @Builder.Default private final long bytesWritten = -1L;
+  @Builder.Default private final long recordsWritten = -1L;
+  @Builder.Default private final long filesCommitted = -1L;
+  @Builder.Default private final long snapshotsCommitted = -1L;
+  @Builder.Default private final long partitionsCommitted = -1L;
 }
