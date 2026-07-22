@@ -264,6 +264,18 @@
                 "type": ["null","string"],
                 "doc": "Whether the dataset passed the overall data quality check",
                 "default": null
+              },
+              {
+                "name": "snapshotsCommitted",
+                "type": "long",
+                "doc": "Number of table snapshots committed for the dataset in this run (e.g. Iceberg snapshot-replication commits), -1 if unsupported/unknown by the writer",
+                "default": -1
+              },
+              {
+                "name": "partitionsCommitted",
+                "type": "long",
+                "doc": "Number of partitions committed for the dataset in this run, -1 if unsupported/unknown by the writer",
+                "default": -1
               }
             ]
           }
