@@ -18,6 +18,7 @@
 package org.apache.gobblin.runtime;
 
 import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.NonNull;
@@ -34,6 +35,7 @@ import org.apache.gobblin.metrics.DatasetMetric;
 @Data
 @Setter(AccessLevel.NONE) // NOTE: non-`final` members solely to enable deserialization
 @RequiredArgsConstructor
+@AllArgsConstructor
 @NoArgsConstructor
 @ToString
 public class DatasetTaskSummary {
@@ -43,11 +45,12 @@ public class DatasetTaskSummary {
   @NonNull private boolean successfullyCommitted;
   @NonNull private String dataQualityStatus;
   // NOTE: intentionally NOT @NonNull so the 5-arg @RequiredArgsConstructor stays intact for native
-  // Gobblin call sites (AbstractJobLauncher). Populated via reflection during JSON deserialization
-  // of events that carry them (e.g. DDM Iceberg snapshot replication). Both are comma-separated
-  // lists (a run can commit more than one snapshot/partition); null = unsupported/unreported.
-  private String snapshotsCommitted = null;
-  private String partitionsCommitted = null;
+  // Gobblin call sites (AbstractJobLauncher). Usually populated via reflection during JSON
+  // deserialization of events that carry them (e.g. DDM Iceberg snapshot replication); the
+  // @AllArgsConstructor gives native producers a direct path. Both are comma-separated lists (a
+  // run can commit more than one snapshot/partition); null = unsupported/unreported.
+  private String snapshotsCommitted;
+  private String partitionsCommitted;
 
   /**
    * Convert a {@link DatasetTaskSummary} to a {@link DatasetMetric}.
